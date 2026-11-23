@@ -37,6 +37,9 @@ using namespace Qt::StringLiterals;
 #include "qgsproject.h"
 #include "qgsxmlutils.h"
 #include "qgsvectortilelayer.h"
+#include "qgscoordinatetransform.h"
+#include "qgsgeometry.h"
+#include "qgsvectordataprovider.h"
 
 /**
  * \ingroup UnitTests
@@ -83,6 +86,10 @@ class TestQgsMapLayer : public QObject
     void publicSourceOnGdalWithCredentials();
 
     void cloneServerProperties();
+
+    void writeLayerXmlExtentNotRecalculated();
+    void writeLayerXmlLazyExtent();
+    void writeLayerXmlWgs84ExtentFromTrustedLayer();
 
   private:
     QgsVectorLayer *mpLayer = nullptr;
@@ -612,6 +619,90 @@ void TestQgsMapLayer::cloneServerProperties()
   QCOMPARE( clone->serverProperties()->metadataUrls().at( 0 ), metadataUrl );
   QCOMPARE( clone->serverProperties()->wmsDimensions().size(), 1 );
   QCOMPARE( clone->serverProperties()->wmsDimensions().at( 0 ), wmsDimension );
+}
+
+void TestQgsMapLayer::writeLayerXmlExtentNotRecalculated()
+{
+  QgsVectorLayer layer( u"Point?crs=EPSG:3857&field=id:integer"_s, u"pts"_s, u"memory"_s );
+  QgsFeature f1( layer.fields() );
+  f1.setGeometry( QgsGeometry::fromPointXY( QgsPointXY( 0, 0 ) ) );
+  QgsFeature f2( layer.fields() );
+  f2.setGeometry( QgsGeometry::fromPointXY( QgsPointXY( 100000, 100000 ) ) );
+  QgsFeatureList features { f1, f2 };
+  QVERIFY( layer.dataProvider()->addFeatures( features ) );
+  const QgsRectangle knownExtent = layer.extent();
+  QCOMPARE( knownExtent, QgsRectangle( 0, 0, 100000, 100000 ) );
+
+  // a changed geometry in the edit buffer makes the next extent() call iterate all features
+  QVERIFY( layer.startEditing() );
+  QgsFeature feature;
+  QVERIFY( layer.getFeatures().nextFeature( feature ) );
+  QgsGeometry movedGeometry = QgsGeometry::fromPointXY( QgsPointXY( -200000, -200000 ) );
+  QVERIFY( layer.changeGeometry( feature.id(), movedGeometry ) );
+
+  const QSignalSpy spy( &layer, &QgsMapLayer::recalculateExtents );
+  QDomDocument doc( u"testdoc"_s );
+  QDomElement layerElement = doc.createElement( u"maplayer"_s );
+  QVERIFY( layer.writeLayerXml( layerElement, doc, QgsReadWriteContext() ) );
+  QCOMPARE( spy.count(), 0 );
+
+  // both saved extents describe the same, last known extent
+  QCOMPARE( QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"extent"_s ) ), knownExtent );
+  QgsCoordinateTransform transform( layer.crs(), QgsCoordinateReferenceSystem( u"EPSG:4326"_s ), QgsCoordinateTransformContext() );
+  transform.setBallparkTransformsAreAppropriate( true );
+  const QgsRectangle savedWgs84Extent = QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"wgs84extent"_s ) );
+  QGSCOMPARENEARRECTANGLE( savedWgs84Extent, transform.transformBoundingBox( knownExtent ), 1e-9 );
+
+  layer.rollBack();
+}
+
+void TestQgsMapLayer::writeLayerXmlLazyExtent()
+{
+  // the extent of a layer was never requested: the layer extent is still written (GH #61181)
+  QgsVectorLayer layer( u"Point?crs=EPSG:4326&field=id:integer"_s, u"pts"_s, u"memory"_s );
+  QgsFeature f( layer.fields() );
+  f.setGeometry( QgsGeometry::fromPointXY( QgsPointXY( 1, 2 ) ) );
+  QgsFeatureList features { f };
+  QVERIFY( layer.dataProvider()->addFeatures( features ) );
+
+  QDomDocument doc( u"testdoc"_s );
+  QDomElement layerElement = doc.createElement( u"maplayer"_s );
+  QVERIFY( layer.writeLayerXml( layerElement, doc, QgsReadWriteContext() ) );
+  QCOMPARE( QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"extent"_s ) ), QgsRectangle( 1, 2, 1, 2 ) );
+  QCOMPARE( QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"wgs84extent"_s ) ), QgsRectangle( 1, 2, 1, 2 ) );
+}
+
+void TestQgsMapLayer::writeLayerXmlWgs84ExtentFromTrustedLayer()
+{
+  // with trusted layer metadata the in-memory WGS84 extent keeps the value read from the project;
+  // the saved WGS84 extent is derived from the saved layer extent instead
+  QgsVectorLayer source( u"Point?crs=EPSG:4326&field=id:integer"_s, u"pts"_s, u"memory"_s );
+  QgsFeature f( source.fields() );
+  f.setGeometry( QgsGeometry::fromPointXY( QgsPointXY( 1, 2 ) ) );
+  QgsFeatureList features { f };
+  QVERIFY( source.dataProvider()->addFeatures( features ) );
+  QDomDocument doc( u"testdoc"_s );
+  QDomElement sourceElement = doc.createElement( u"maplayer"_s );
+  QVERIFY( source.writeLayerXml( sourceElement, doc, QgsReadWriteContext() ) );
+
+  QgsVectorLayer layer;
+  QgsReadWriteContext context;
+  QVERIFY( layer.readLayerXml( sourceElement, context, QgsMapLayer::FlagTrustLayerMetadata | QgsMapLayer::FlagReadExtentFromXml ) );
+  QCOMPARE( layer.wgs84Extent(), QgsRectangle( 1, 2, 1, 2 ) );
+
+  QVERIFY( layer.startEditing() );
+  QgsFeature added( layer.fields() );
+  added.setGeometry( QgsGeometry::fromPointXY( QgsPointXY( 3, 4 ) ) );
+  QVERIFY( layer.addFeature( added ) );
+  layer.updateExtents( true );
+  QCOMPARE( layer.extent(), QgsRectangle( 3, 4, 3, 4 ) );
+  QCOMPARE( layer.wgs84Extent(), QgsRectangle( 1, 2, 1, 2 ) );
+
+  QDomElement layerElement = doc.createElement( u"maplayer"_s );
+  QVERIFY( layer.writeLayerXml( layerElement, doc, QgsReadWriteContext() ) );
+  QCOMPARE( QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"extent"_s ) ), QgsRectangle( 3, 4, 3, 4 ) );
+  QCOMPARE( QgsXmlUtils::readRectangle( layerElement.firstChildElement( u"wgs84extent"_s ) ), QgsRectangle( 3, 4, 3, 4 ) );
+  layer.rollBack();
 }
 
 QGSTEST_MAIN( TestQgsMapLayer )

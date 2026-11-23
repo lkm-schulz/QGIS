@@ -751,23 +751,52 @@ bool QgsMapLayer::readXml( const QDomNode &layer_node, QgsReadWriteContext &cont
 } // void QgsMapLayer::readXml
 
 
+// Transforms an extent in the layer CRS to EPSG:4326. Returns a null rectangle for a null extent,
+// a layer CRS not on Earth, or a failed transformation.
+static QgsRectangle transformExtentToWgs84( const QgsMapLayer *layer, const QgsRectangle &extent )
+{
+  if ( extent.isNull() || !layer->crs().isEarthCrs() )
+    return QgsRectangle();
+
+  QgsCoordinateTransform transformer { layer->crs(), QgsCoordinateReferenceSystem( u"EPSG:4326"_s ), layer->transformContext() };
+  transformer.setBallparkTransformsAreAppropriate( true );
+  try
+  {
+    return transformer.transformBoundingBox( extent );
+  }
+  catch ( const QgsCsException &cse )
+  {
+    QgsMessageLog::logMessage( QgsMapLayer::tr( "Error transforming extent: %1" ).arg( cse.what() ) );
+    return QgsRectangle();
+  }
+}
+
 bool QgsMapLayer::writeLayerXml( QDomElement &layerElement, QDomDocument &document, const QgsReadWriteContext &context ) const
 {
   QGIS_PROTECT_QOBJECT_THREAD_ACCESS
 
+  // The extent last known to the layer is written, without recalculation: recalculating can be
+  // expensive (a vector layer with uncommitted geometry changes iterates all features) and
+  // the saved extents are only read back when layer metadata is trusted.
+  QgsRectangle extent2D;
   if ( !mExtent3D.isNull() && dataProvider() && dataProvider()->elevationProperties() && dataProvider()->elevationProperties()->containsElevationData() )
+  {
     layerElement.appendChild( QgsXmlUtils::writeBox3D( mExtent3D, document ) );
+    extent2D = mExtent2D.isNull() ? mExtent3D.toRectangle() : mExtent2D;
+  }
   else
   {
     // Extent might be null because lazily set
-    const QgsRectangle extent2D { mExtent2D.isNull() ? extent() : mExtent2D };
+    extent2D = mExtent2D.isNull() ? extent() : mExtent2D;
     if ( !extent2D.isNull() )
     {
       layerElement.appendChild( QgsXmlUtils::writeRectangle( extent2D, document ) );
     }
   }
 
-  if ( const QgsRectangle lWgs84Extent = wgs84Extent( true ); !lWgs84Extent.isNull() )
+  // Derived from the saved extent rather than taken from mWgs84Extent, which keeps the value
+  // read from the project when layer metadata is trusted.
+  if ( const QgsRectangle lWgs84Extent = transformExtentToWgs84( this, extent2D ); !lWgs84Extent.isNull() )
   {
     layerElement.appendChild( QgsXmlUtils::writeRectangle( lWgs84Extent, document, u"wgs84extent"_s ) );
   }
@@ -3059,20 +3088,7 @@ QgsRectangle QgsMapLayer::wgs84Extent( bool forceRecalculate ) const
   }
   else if ( !mExtent2D.isNull() || !mExtent3D.isNull() )
   {
-    QgsCoordinateTransform transformer { crs(), QgsCoordinateReferenceSystem( u"EPSG:4326"_s ), transformContext() };
-    transformer.setBallparkTransformsAreAppropriate( true );
-    try
-    {
-      if ( mExtent2D.isNull() )
-        wgs84Extent = transformer.transformBoundingBox( mExtent3D.toRectangle() );
-      else
-        wgs84Extent = transformer.transformBoundingBox( mExtent2D );
-    }
-    catch ( const QgsCsException &cse )
-    {
-      QgsMessageLog::logMessage( tr( "Error transforming extent: %1" ).arg( cse.what() ) );
-      wgs84Extent = QgsRectangle();
-    }
+    wgs84Extent = transformExtentToWgs84( this, mExtent2D.isNull() ? mExtent3D.toRectangle() : mExtent2D );
   }
   return wgs84Extent;
 }
