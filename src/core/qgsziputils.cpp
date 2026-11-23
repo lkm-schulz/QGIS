@@ -15,8 +15,10 @@
 
 #include "qgsziputils.h"
 
+#include <cstring>
 #include <fstream>
 #include <iostream>
+#include <vector>
 #include <zip.h>
 #include <zlib.h>
 
@@ -143,7 +145,66 @@ bool QgsZipUtils::unzip( const QString &zipFilename, const QString &dir, QString
   return true;
 }
 
-bool QgsZipUtils::zip( const QString &zipFilename, const QStringList &files, bool overwrite )
+namespace
+{
+  // Returns TRUE if the entry at index in archive holds exactly the bytes of the file at path.
+  bool entryEqualsFile( struct zip *archive, zip_uint64_t index, const QString &path )
+  {
+    QFile file( path );
+    if ( !file.open( QIODevice::ReadOnly ) )
+      return false;
+
+    struct zip_file *entry = zip_fopen_index( archive, index, 0 );
+    if ( !entry )
+      return false;
+
+    constexpr qint64 CHUNK_SIZE = 1 << 16;
+    std::vector<char> fileBuffer( CHUNK_SIZE );
+    std::vector<char> entryBuffer( CHUNK_SIZE );
+    bool equal = true;
+    while ( equal )
+    {
+      const qint64 fileRead = file.read( fileBuffer.data(), CHUNK_SIZE );
+      // zip_fread() also verifies the CRC of the entry once the end is reached.
+      const zip_int64_t entryRead = zip_fread( entry, entryBuffer.data(), CHUNK_SIZE );
+      equal = fileRead >= 0 && fileRead == entryRead && std::memcmp( fileBuffer.data(), entryBuffer.data(), static_cast<size_t>( fileRead ) ) == 0;
+      if ( fileRead <= 0 )
+        break;
+    }
+    zip_fclose( entry );
+    return equal;
+  }
+
+  // Returns a source which copies the compressed data of the entry named after the file from
+  // reuseArchive, or nullptr if reuseArchive has no such entry with content identical to the file.
+  struct zip_source *reusedEntrySource( struct zip *archive, struct zip *reuseArchive, const QFileInfo &fileInfo )
+  {
+    if ( !reuseArchive )
+      return nullptr;
+
+    const QByteArray name = fileInfo.fileName().toUtf8();
+    const zip_int64_t index = zip_name_locate( reuseArchive, name.constData(), 0 );
+    if ( index < 0 )
+      return nullptr;
+
+    struct zip_stat stat;
+    zip_stat_init( &stat );
+    if ( zip_stat_index( reuseArchive, index, 0, &stat ) != 0 || !( stat.valid & ZIP_STAT_SIZE ) || stat.size != static_cast<zip_uint64_t>( fileInfo.size() ) )
+      return nullptr;
+
+    if ( !entryEqualsFile( reuseArchive, index, fileInfo.absoluteFilePath() ) )
+      return nullptr;
+
+    // With the compressed data as source, libzip writes the entry with its original compression method and without recompressing it.
+#if LIBZIP_VERSION_MAJOR > 1 || ( LIBZIP_VERSION_MAJOR == 1 && LIBZIP_VERSION_MINOR >= 10 )
+    return zip_source_zip_file( archive, reuseArchive, index, ZIP_FL_COMPRESSED, 0, -1, nullptr );
+#else
+    return zip_source_zip( archive, reuseArchive, index, ZIP_FL_COMPRESSED, 0, -1 );
+#endif
+  }
+} // namespace
+
+bool QgsZipUtils::zip( const QString &zipFilename, const QStringList &files, bool overwrite, const QString &reuseFrom )
 {
   if ( zipFilename.isEmpty() )
   {
@@ -157,18 +218,37 @@ bool QgsZipUtils::zip( const QString &zipFilename, const QStringList &files, boo
 
   if ( rc == ZIP_ER_OK && z )
   {
+    // Entries copied from this archive are read when z is closed, so it stays open until then.
+    struct zip *reuseArchive = nullptr;
+    if ( !reuseFrom.isEmpty() && QFileInfo( reuseFrom ).isFile() )
+    {
+      int reuseRc = 0;
+      reuseArchive = zip_open( reuseFrom.toUtf8().constData(), 0, &reuseRc );
+      if ( !reuseArchive )
+        QgsDebugMsgLevel( u"Cannot reuse entries of '%1' (error code %2)"_s.arg( reuseFrom ).arg( reuseRc ), 2 );
+    }
+    const auto closeArchives = [z, reuseArchive] {
+      zip_close( z );
+      if ( reuseArchive )
+        zip_discard( reuseArchive );
+    };
+
     for ( const auto &file : files )
     {
       const QFileInfo fileInfo( file );
       if ( !fileInfo.exists() )
       {
         QgsMessageLog::logMessage( QObject::tr( "Error input file does not exist: '%1'" ).arg( file ) );
-        zip_close( z );
+        closeArchives();
         return false;
       }
 
-      const QByteArray fileNamePtr = file.toUtf8();
-      zip_source *src = zip_source_file( z, fileNamePtr.constData(), 0, 0 );
+      zip_source *src = reusedEntrySource( z, reuseArchive, fileInfo );
+      if ( !src )
+      {
+        const QByteArray fileNamePtr = file.toUtf8();
+        src = zip_source_file( z, fileNamePtr.constData(), 0, 0 );
+      }
       if ( src )
       {
         const QByteArray fileInfoPtr = fileInfo.fileName().toUtf8();
@@ -180,19 +260,30 @@ bool QgsZipUtils::zip( const QString &zipFilename, const QStringList &files, boo
         if ( rc == -1 )
         {
           QgsMessageLog::logMessage( QObject::tr( "Error adding file '%1': %2" ).arg( file, zip_strerror( z ) ) );
-          zip_close( z );
+          zip_source_free( src );
+          closeArchives();
           return false;
         }
       }
       else
       {
         QgsMessageLog::logMessage( QObject::tr( "Error creating data source '%1': %2" ).arg( file, zip_strerror( z ) ) );
-        zip_close( z );
+        closeArchives();
         return false;
       }
     }
 
-    zip_close( z );
+    // libzip writes the archive, including the reused entries, only when closing it.
+    const bool closed = zip_close( z ) == 0;
+    if ( !closed )
+    {
+      QgsMessageLog::logMessage( QObject::tr( "Error writing zip archive '%1': %2" ).arg( zipFilename, zip_strerror( z ) ) );
+      zip_discard( z );
+    }
+    if ( reuseArchive )
+      zip_discard( reuseArchive );
+    if ( !closed )
+      return false;
   }
   else
   {

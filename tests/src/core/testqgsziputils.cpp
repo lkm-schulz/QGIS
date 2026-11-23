@@ -16,10 +16,13 @@
 #include "qgstest.h"
 #include "qgsziputils.h"
 
+#include <zip.h>
+
 #include <QDirIterator>
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 
 using namespace Qt::StringLiterals;
 
@@ -37,6 +40,8 @@ class TestQgsZipUtils : public QObject
     void unzipWithSubdirs2();
     void specialChars();
     void testZip();
+    void zipReuseEntries();
+    void zipReuseInvalidSource();
 
     void extractFileFromZip_nonExistentZip();
     void extractFileFromZip_emptyZipPath();
@@ -45,6 +50,8 @@ class TestQgsZipUtils : public QObject
     void extractFileFromZip_rootSuccess();
 
   private:
+    static bool writeFile( const QString &path, const QByteArray &content );
+    static qint64 compressedSize( const QString &zipPath, const QString &entry );
     void genericTest( QString zipName, int expectedEntries, bool includeFolders, const QStringList &testFileNames );
 };
 
@@ -119,6 +126,108 @@ void TestQgsZipUtils::testZip()
   QCOMPARE( files.count(), 1 );
   QCOMPARE( files.at( 0 ), QString( zipDirPath + "/aæýì.txt" ) );
   QVERIFY( QFile::exists( zipDirPath + "/aæýì.txt" ) );
+}
+
+bool TestQgsZipUtils::writeFile( const QString &path, const QByteArray &content )
+{
+  QFile file( path );
+  return file.open( QIODevice::WriteOnly | QIODevice::Truncate ) && file.write( content ) == content.size();
+}
+
+qint64 TestQgsZipUtils::compressedSize( const QString &zipPath, const QString &entry )
+{
+  int rc = 0;
+  zip_t *archive = zip_open( zipPath.toUtf8().constData(), ZIP_RDONLY, &rc );
+  if ( !archive )
+    return -1;
+  zip_stat_t stat;
+  zip_stat_init( &stat );
+  const qint64 size = zip_stat( archive, entry.toUtf8().constData(), 0, &stat ) == 0 ? static_cast<qint64>( stat.comp_size ) : -1;
+  zip_discard( archive );
+  return size;
+}
+
+void TestQgsZipUtils::zipReuseEntries()
+{
+  const QTemporaryDir dir;
+  QVERIFY( dir.isValid() );
+  const QString unchanged = dir.filePath( u"unchanged.txt"_s );
+  const QString changed = dir.filePath( u"changed.txt"_s );
+  const QString added = dir.filePath( u"added.txt"_s );
+
+  // Text which compresses to different sizes at different compression levels.
+  const QList<QByteArray> words { "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit", "sed", "do" };
+  QByteArray content;
+  quint32 state = 1;
+  for ( int i = 0; i < 20000; ++i )
+  {
+    state = state * 1103515245 + 12345;
+    content += words.at( ( state >> 16 ) % words.size() ) + ' ';
+  }
+  QVERIFY( writeFile( unchanged, content ) );
+  QVERIFY( writeFile( changed, content ) );
+  QVERIFY( writeFile( added, content ) );
+
+  // Previous archive compressed at the fastest level: an entry copied from it keeps its compressed size,
+  // an entry written from the file gets the size of a fresh archive at the default level.
+  const QString previous = dir.filePath( u"previous.zip"_s );
+  {
+    int rc = 0;
+    zip_t *archive = zip_open( previous.toUtf8().constData(), ZIP_CREATE | ZIP_TRUNCATE, &rc );
+    QVERIFY( archive );
+    for ( const QString &file : { unchanged, changed } )
+    {
+      zip_source_t *source = zip_source_file( archive, file.toUtf8().constData(), 0, 0 );
+      QVERIFY( source );
+      const zip_int64_t index = zip_file_add( archive, QFileInfo( file ).fileName().toUtf8().constData(), source, 0 );
+      QVERIFY( index >= 0 );
+      QCOMPARE( zip_set_file_compression( archive, index, ZIP_CM_DEFLATE, 1 ), 0 );
+    }
+    QCOMPARE( zip_close( archive ), 0 );
+  }
+
+  // Same size, different content.
+  QByteArray changedContent = content;
+  changedContent[changedContent.size() - 1] = 'X';
+  QVERIFY( writeFile( changed, changedContent ) );
+
+  const QString fresh = dir.filePath( u"fresh.zip"_s );
+  QVERIFY( QgsZipUtils::zip( fresh, { unchanged, changed, added } ) );
+  const QString output = dir.filePath( u"output.zip"_s );
+  QVERIFY( QgsZipUtils::zip( output, { unchanged, changed, added }, true, previous ) );
+
+  QVERIFY( compressedSize( previous, u"unchanged.txt"_s ) != compressedSize( fresh, u"unchanged.txt"_s ) );
+  QCOMPARE( compressedSize( output, u"unchanged.txt"_s ), compressedSize( previous, u"unchanged.txt"_s ) );
+  QCOMPARE( compressedSize( output, u"changed.txt"_s ), compressedSize( fresh, u"changed.txt"_s ) );
+  QCOMPARE( compressedSize( output, u"added.txt"_s ), compressedSize( fresh, u"added.txt"_s ) );
+  QCOMPARE( QgsZipUtils::files( output ), QStringList( { u"unchanged.txt"_s, u"changed.txt"_s, u"added.txt"_s } ) );
+
+  QByteArray extracted;
+  QVERIFY( QgsZipUtils::extractFileFromZip( output, u"unchanged.txt"_s, extracted ) );
+  QCOMPARE( extracted, content );
+  QVERIFY( QgsZipUtils::extractFileFromZip( output, u"changed.txt"_s, extracted ) );
+  QCOMPARE( extracted, changedContent );
+  QVERIFY( QgsZipUtils::extractFileFromZip( output, u"added.txt"_s, extracted ) );
+  QCOMPARE( extracted, content );
+}
+
+void TestQgsZipUtils::zipReuseInvalidSource()
+{
+  const QTemporaryDir dir;
+  QVERIFY( dir.isValid() );
+  const QString file = dir.filePath( u"file.txt"_s );
+  QVERIFY( writeFile( file, "content" ) );
+  const QString notAZip = dir.filePath( u"not_a_zip.zip"_s );
+  QVERIFY( writeFile( notAZip, "not a zip file" ) );
+
+  for ( const QString &reuseFrom : { notAZip, dir.filePath( u"missing.zip"_s ), dir.path() } )
+  {
+    const QString output = dir.filePath( u"output.zip"_s );
+    QVERIFY( QgsZipUtils::zip( output, { file }, true, reuseFrom ) );
+    QByteArray extracted;
+    QVERIFY( QgsZipUtils::extractFileFromZip( output, u"file.txt"_s, extracted ) );
+    QCOMPARE( extracted, QByteArray( "content" ) );
+  }
 }
 
 /**

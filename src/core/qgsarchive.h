@@ -45,6 +45,8 @@ class CORE_EXPORT QgsArchive
 
     /**
      * Zip the content of this archive
+     *
+     * If \a zipFilename already exists, the entries of the existing zip file whose content is unchanged are copied without recompression.
      * \param zipFilename The name of the zip to generate
      * \returns FALSE if something goes wrong, TRUE otherwise
      */

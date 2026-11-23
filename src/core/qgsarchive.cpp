@@ -69,8 +69,8 @@ bool QgsArchive::zip( const QString &filename )
 {
   const QString tempPath( QDir::temp().absoluteFilePath( u"qgis-project-XXXXXX.zip"_s ) );
 
-  // zip content
-  if ( !QgsZipUtils::zip( tempPath, mFiles, true ) )
+  // zip content, copying entries which are unchanged since the previous save without recompressing them
+  if ( !QgsZipUtils::zip( tempPath, mFiles, true, filename ) )
   {
     const QString err = QObject::tr( "Unable to zip content" );
     QgsMessageLog::logMessage( err, u"QgsArchive"_s );

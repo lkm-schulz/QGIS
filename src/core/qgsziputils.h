@@ -55,8 +55,9 @@ class CORE_EXPORT QgsZipUtils
      * \param zip The zip filename
      * \param files The absolute path to files to embed within the zip
      * \param overwrite Set to TRUE to allow overwriting existing files (since QGIS 3.44)
+     * \param reuseFrom Optional path of an existing zip file. A file whose content is identical to the entry with the same name in this zip file is copied from there without recompression. A missing or unreadable zip file is ignored. (since QGIS 4.6)
      */
-    static bool zip( const QString &zip, const QStringList &files, bool overwrite = false );
+    static bool zip( const QString &zip, const QStringList &files, bool overwrite = false, const QString &reuseFrom = QString() );
 
     /**
      * Decodes gzip byte stream, returns TRUE on success. Useful for reading vector tiles.

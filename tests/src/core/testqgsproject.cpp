@@ -67,6 +67,7 @@ class TestQgsProject : public QObject
     void testDefaultRelativePaths();
     void testAttachmentsQgs();
     void testAttachmentsQgz();
+    void testAttachmentsQgzResave();
     void testAttachmentIdentifier();
     void testEmbeddedGroupWithJoins();
     void testAsynchronousLayerLoading();
@@ -968,6 +969,46 @@ void TestQgsProject::testAttachmentsQgz()
     p2.removeMapLayer( p2layer->id() );
     QVERIFY( !QFile( path ).exists() );
   }
+}
+
+void TestQgsProject::testAttachmentsQgzResave()
+{
+  // Saving over an existing .qgz copies unchanged entries from it, so changes to an attachment must still reach the new file.
+  QTemporaryFile projFile( QDir::temp().absoluteFilePath( "XXXXXX_test.qgz" ) );
+  QVERIFY( projFile.open() );
+
+  QgsProject p;
+  const QString fileName = p.createAttachedFile( "myattachment" );
+  const auto writeAttachment = [&fileName]( const QByteArray &content ) {
+    QFile file( fileName );
+    return file.open( QIODevice::WriteOnly | QIODevice::Truncate ) && file.write( content ) == content.size();
+  };
+  const auto readAttachment = []( const QString &projectPath ) {
+    QgsProject p2;
+    if ( !p2.read( projectPath ) )
+      return QByteArray();
+    for ( const QString &attachment : p2.attachedFiles() )
+    {
+      if ( attachment.endsWith( "myattachment"_L1 ) )
+      {
+        QFile file( attachment );
+        return file.open( QIODevice::ReadOnly ) ? file.readAll() : QByteArray();
+      }
+    }
+    return QByteArray();
+  };
+
+  QVERIFY( writeAttachment( "Attachment A" ) );
+  QVERIFY( p.write( projFile.fileName() ) );
+  QCOMPARE( readAttachment( projFile.fileName() ), QByteArray( "Attachment A" ) );
+
+  QVERIFY( p.write( projFile.fileName() ) );
+  QCOMPARE( readAttachment( projFile.fileName() ), QByteArray( "Attachment A" ) );
+
+  // Same size, different content
+  QVERIFY( writeAttachment( "Attachment B" ) );
+  QVERIFY( p.write( projFile.fileName() ) );
+  QCOMPARE( readAttachment( projFile.fileName() ), QByteArray( "Attachment B" ) );
 }
 
 void TestQgsProject::testAttachmentIdentifier()
